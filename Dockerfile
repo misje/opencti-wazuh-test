@@ -12,7 +12,7 @@ FROM python:3.12-alpine
 WORKDIR /app
 ENV CONNECTOR_TYPE=INTERNAL_ENRICHMENT
 
-LABEL org.opencontainers.image.description="Wazuh OpenCTI enrichment connector"
+LABEL org.opencontainers.image.description "Wazuh OpenCTI enrichment connector"
 LABEL org.opencontainers.image.documentation="https://misje.github.io/opencti-wazuh-connector"
 LABEL org.opencontainers.image.licenses="Apache 2.0"
 # TODO:

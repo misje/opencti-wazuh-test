@@ -25,6 +25,11 @@ jobs:
       contents: read
       packages: write
       attestations: write
+    strategy:
+      matrix:
+        opencti_version:
+          - 6.1.0
+          - 6.2.0
     steps:
       - uses: actions/checkout@v4
 
@@ -37,17 +42,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-            #- name: Extract OpenCTI version
-            #  run: |
-            #    echo "OPENCTI_VERSION=$(grep -oP 'pycti==\K.+')" >> $GITHUB_ENV
-
       - name: Extract metadata (tags, labels) for docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
-            suffix=_${{ env.OPENCTI_VERSION }}
+            suffix=_${{ matrix.opencti_version }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -65,7 +66,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            OPENCTI_VERSION=${{ env.OPENCTI_VERSION }}
+            OPENCTI_VERSION=${{ matrix.opencti_version }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
