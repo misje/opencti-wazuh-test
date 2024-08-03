@@ -65,6 +65,7 @@ jobs:
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          load: true
           build-args: |
             OPENCTI_VERSION=${{ matrix.opencti_version }}
 
