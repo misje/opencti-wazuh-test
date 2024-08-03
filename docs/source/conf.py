@@ -1,14 +1,15 @@
 import os
 import sys
+import subprocess
 
 # -- Project information -----------------------------------------------------
 project = "opencti-wazuh-connector"
 copyright = "2024, Andreas Misje"  # pylint: disable=redefined-builtin
 author = "Andreas Misje"
-release = "0.3.0"
-## The full version, including alpha/beta/rc tags
-# with open("../../../version.txt", "r") as f:
-#    release = f.readline().rstrip()
+# Get latest release version from the last git tag on the current branch:
+release = subprocess.run(
+    ["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True
+).stdout.rstrip()
 
 # -- General configuration ---------------------------------------------------
 extensions = [
