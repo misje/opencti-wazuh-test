@@ -53,6 +53,8 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          annotations: |
+            opencti_version=${{ matrix.opencti_version }}
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
 
