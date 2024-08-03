@@ -17,7 +17,18 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push-image:
+  load_opencti_versions:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: load_versinos
+        run: |
+          JSON=$(cat ../../opencti_versions.json)
+          echo "::set-output name=matrix::${JSON}"
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+  build_and_push_image:
     runs-on: ubuntu-22.04
     permissions:
       id-token: write
@@ -25,10 +36,8 @@ jobs:
       packages: write
       attestations: write
     strategy:
-      matrix:
-        opencti_version:
-          - 6.1.0
-          - 6.2.0
+      matrix: ${{ fromJson(needs.load_opencti_versions.outputs.matrix) }}
+
     steps:
       - uses: actions/checkout@v4
 
