@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: load_versinos
         run: |
-          JSON=$(cat ../../opencti_versions.json)
+          JSON=$(cat opencti_versions.json)
           echo "::set-output name=matrix::${JSON}"
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
