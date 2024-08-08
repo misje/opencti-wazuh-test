@@ -1,6 +1,7 @@
+import json
 import os
-import sys
 import subprocess
+import sys
 
 # -- Project information -----------------------------------------------------
 project = "opencti-wazuh-connector"
@@ -11,7 +12,26 @@ release = subprocess.run(
     ["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True
 ).stdout.rstrip()
 
+# -- misc. ---------- --------------------------------------------------------
+# Generate table of "compatible" OpenCTI versions:
+with open("prev_opencti_versions", "r", encoding="utf-8") as rst_in, open(
+    "current_opencti_versions.rst", "w", encoding="utf-8"
+) as rst_out, open("../../build_metadata.json", "r", encoding="utf-8") as build_meta:
+    octi_versions = sorted(json.load(build_meta)["opencti_version"])
+    latest_octi_version = octi_versions[-1]
+    for line in rst_in:
+        rst_out.write(line)
+
+    release_link = "https://github.com/OpenCTI-Platform/opencti/releases/tag/"
+    rst_out.write(f"   * - {release}\n")
+    rst_out.write(
+        "     - "
+        + ", ".join([f"`{ver} <{release_link}{ver}>`_" for ver in octi_versions])
+        + "\n\n"
+    )
+
 # -- General configuration ---------------------------------------------------
+sys.path.insert(0, os.path.abspath("extensions"))
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
@@ -23,6 +43,7 @@ extensions = [
     "sphinx_rtd_theme",
     "sphinxcontrib.autodoc_pydantic",
     "sphinxcontrib.mermaid",
+    "subst_include",
 ]
 # Sjekk ut autosummary
 
@@ -32,9 +53,16 @@ exclude_patterns = []
 add_module_names = False
 pygments_style = "sphinx"
 
-rst_epilog = f"""
-.. |version| replace:: {release}
-"""
+# TODO: replace minion, redis etc. versions in opencti-compose.yml
+# Used by the custom integration subst_include:
+substitutions = {
+    "|latest|": f"{release}_{latest_octi_version}",
+    "|latest_octi_ver|": latest_octi_version,
+}
+# General substitutions using epilog:
+rst_epilog = "\n".join(
+    (f".. {key} replace:: {value}" for key, value in substitutions.items())
+)
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "sphinx_rtd_theme"
