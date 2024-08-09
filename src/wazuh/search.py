@@ -16,6 +16,7 @@ from .opensearch import OpenSearchClient
 from .opensearch_dsl import Bool, Match, MultiMatch, QueryType, Regexp, Wildcard
 from .utils import (
     field_as_list,
+    field_or_default,
     get_path_sep,
     is_registry_path,
     oneof_nonempty,
@@ -72,7 +73,8 @@ class AlertSearcher(BaseModel):
                 return self.query_reg_value(stix_entity=stix_entity)
             case "Process":
                 return self.query_process(stix_entity=stix_entity)
-            # TODO: software
+            case "Software":
+                return self.query_software(stix_entity=stix_entity)
             case "Vulnerability":
                 return self.query_vulnerability(stix_entity=stix_entity)
             case "User-Account":
@@ -236,6 +238,14 @@ class AlertSearcher(BaseModel):
             log.info("Observable has no hashes and no file names")
             return None
 
+        if (
+            has_hash
+            and field_or_default(stix_entity, "hashes.SHA-256", "")
+            == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ):
+            log.info("Ignoring SHA-256 hash of an empty file")
+            return None
+
         paths = list(
             {
                 parent_path + sep + filename if parent_path else filename
@@ -330,7 +340,7 @@ class AlertSearcher(BaseModel):
                                 # prepend a regex that ignores everything up to
                                 # and including a path separator before the
                                 # filename:
-                                p if isabs(path) else f".*[/\\\\]*{p}"
+                                p if isabs(path) else f"(.*[/\\\\])?{p}"
                                 for path in paths
                                 # Support any number of backslash escapes in
                                 # paths (many variants are seen in the wild):
@@ -436,6 +446,7 @@ class AlertSearcher(BaseModel):
             ]
         )
 
+    # TODO: data.port (syscollector)
     def query_traffic(self, *, stix_entity: dict) -> dict | None:
         """
         Search for :stix:`network traffic <#_rgnc3w40xy>` :term:`SCOs <SCO>`
@@ -694,12 +705,13 @@ class AlertSearcher(BaseModel):
         """
         url = entity["observable_value"]
         fields = [
-            "data.url",
-            "data.uri",
             "data.URL",
-            "data.office365.MessageURLs",
+            "data.docker.Actor.Attributes.org.opencontainers.image.source",
             "data.github.config.url",
+            "data.office365.MessageURLs",
             "data.office365.SiteUrl",
+            "data.uri",
+            "data.url",
         ]
         if (
             not self.config.lookup_url_without_host
@@ -778,10 +790,11 @@ class AlertSearcher(BaseModel):
             return None
 
         dir_fields = [
-            "data.audit.directory.name",
             "data.SourceFilePath",
             "data.TargetPath",
+            "data.audit.directory.name",
             "data.home",
+            "data.office365.SourceRelativeUrl",
             "data.pwd",
             "syscheck.path",
         ]
@@ -837,7 +850,6 @@ class AlertSearcher(BaseModel):
                         "data.win.eventdata.sourceImage",
                         "data.win.eventdata.targetImage",
                     ]
-                    # TODO: search data.office365.SourceFileName (or ObjectId for path as well)
                 ]
             )
 
@@ -967,6 +979,7 @@ class AlertSearcher(BaseModel):
             else None
         )
 
+    # TODO: syearch syscollector alerts (custom events). look at group:syscollector (100326) for IDs.
     def query_process(self, *, stix_entity: dict) -> dict | None:
         """
         Search for :stix:`process <#_hpppnm86a1jm>` command lines
@@ -997,8 +1010,8 @@ class AlertSearcher(BaseModel):
         performed for each individual argument in command line fields on a
         non-whitespace boundary, e.g.:
 
-        - "C:\\foo\\bar baz 'qux quux'" will search for "baz" and match " baz", "
-          baz" and " baz ", but not "bazaar"
+        - "C:\\\\foo\\\\bar baz 'qux quux'" will search for "baz" and match "
+          baz", " baz" and " baz ", but not "bazaar"
 
         For alerts with argument fields, like data.audit.execve, the argument
         are matched as they are.
@@ -1010,7 +1023,6 @@ class AlertSearcher(BaseModel):
            disable regexp searches, disable process searching altogether by not
            specifying "Process" in the connector scope.
         """
-        # TODO: use wazuh API to list proceses too:
         # TODO: Create a guard against too simple search strings (one word?)
         if "command_line" not in stix_entity:
             log.info("Observable does not contain command_line")
@@ -1108,6 +1120,30 @@ class AlertSearcher(BaseModel):
                 )
             ]
         )
+
+    def query_software(self, *, stix_entity: dict) -> dict | None:
+        """
+        Search for :stix:`software <#_7rkyhtkdthok>` in vulnerability detector
+        events
+
+        Currently, the only alerts in Wazuh that contain software information,
+        are vulnerability detection alerts.
+        """
+        match_name = Match(
+            field="data.vulnerability.package.name", query=stix_entity["name"]
+        )
+        if "version" in stix_entity:
+            return self.opensearch.search(
+                must=[
+                    match_name,
+                    Match(
+                        field="data.vulnerability.package.version",
+                        query=stix_entity["version"],
+                    ),
+                ]
+            )
+        else:
+            return self.opensearch.search(must=[match_name])
 
     def query_vulnerability(self, *, stix_entity: dict) -> dict | None:
         """

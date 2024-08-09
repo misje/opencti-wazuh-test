@@ -1,6 +1,6 @@
 services:
   redis:
-    image: redis:7.2.4
+    image: redis:7.2.5
     restart: always
     volumes:
       - redisdata:/data
@@ -33,7 +33,7 @@ services:
         max-size: 50m
 
   minio:
-    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
     volumes:
       - s3data:/data
     ports:
@@ -63,7 +63,7 @@ services:
         max-size: 50m
 
   opencti:
-    image: opencti/platform:6.1.4
+    image: opencti/platform:|latest_octi_ver|
     environment:
       - NODE_OPTIONS=--max-old-space-size=8096
       - APP__PORT=8080
@@ -103,7 +103,7 @@ services:
         max-size: 50m
 
   worker:
-    image: opencti/worker:6.1.1
+    image: opencti/worker:|latest_octi_ver|
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -120,7 +120,7 @@ services:
         max-size: 50m
 
   connector-export-file-stix:
-    image: opencti/connector-export-file-stix:6.1.1
+    image: opencti/connector-export-file-stix:|latest_octi_ver|
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -139,7 +139,7 @@ services:
         max-size: 50m
 
   connector-import-file-stix:
-    image: opencti/connector-import-file-stix:6.1.1
+    image: opencti/connector-import-file-stix:|latest_octi_ver|
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -160,7 +160,7 @@ services:
         max-size: 50m
 
   connector-wazuh:
-    image: ghcr.io/misje/opencti-wazuh-connector:0.2.1
+    image: ghcr.io/misje/opencti-wazuh-connector:|latest|
     restart: always
     environment:
       # A timezone is needed for datetime tools to work as expected:
@@ -178,10 +178,9 @@ services:
       - "WAZUH_OPENSEARCH_PASSWORD=SecretPassword" # Remember double-$ if password contains $:
       - WAZUH_OPENSEARCH_URL=https://mywazuh.example.org:9200
       - WAZUH_OPENSEARCH_USERNAME=cti_connector
-      - WAZUH_OPENSEARCH_VERIFY_TLS=true
+      - WAZUH_OPENSEARCH_VERIFY_TLS=false # Set this to true if you are using a proper certificate in OpenSearch
       - WAZUH_TLPS=TLP:AMBER+STRICT
-    volumes:
-      - /var/cache/wazuh
+      - WAZUH_MAX_TLP=TLP:RED
     # Set a limit on logs:
     logging:
       options:

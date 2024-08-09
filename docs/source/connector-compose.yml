@@ -1,6 +1,6 @@
 services:
   connector-wazuh:
-    image: ghcr.io/misje/opencti-wazuh-connector:0.2.1
+    image: ghcr.io/misje/opencti-wazuh-connector:|latest|
     restart: always
     environment:
       # A timezone is needed for datetime tools to work as expected:
@@ -15,7 +15,6 @@ services:
       - CONNECTOR_LOG_LEVEL=warning
       - CONNECTOR_EXPOSE_METRICS=true
       - AGENTS_AS_SYSTEMS=true
-      - WAZUH_API_ENABLED=false # This API is still in development
       - WAZUH_APP_URL=https://mywazuh.example.org
       - WAZUH_AUTHOR_NAME=Wazuh
       - WAZUH_BUNDLE_ABORT_LIMIT=500
@@ -25,12 +24,16 @@ services:
       - WAZUH_CREATE_INCIDENT_RESPONSE=true
       - WAZUH_CREATE_INCIDENT_SUMMARY=true
       - WAZUH_CREATE_INCIDENT_SUMMARY=true
+      - WAZUH_VULNERABILITY_INCIDENT_CVSS3_SCORE_THRESHOLD= # CVSS3 score (0–10, or empty)
+      - WAZUH_VULNERABILITY_INCIDENT_ACTIVE_ONLY=true
       - WAZUH_CREATE_INCIDENT_THRESHOLD=1
+      - WAZUH_RULE_EXCLUDE_LIST=
+      - WAZUH_INCIDENT_RULE_EXCLUDE_LIST=
       - WAZUH_CREATE_OBS_SIGHTINGS=true
       - WAZUH_CREATE_SIGHTING_SUMMARY=true
       - WAZUH_ENRICH_FILENAME_BEHAVIOUR=create-dir,remove-path
+      - WAZUH_ENRICH_URLS_WITHOUT_HOST=false
       - WAZUH_ENRICH_TYPES=all
-      - WAZUH_ENRICH_AGENT=true
       - WAZUH_ENRICH_LABELS=wazuh_ignore
       - WAZUH_HITS_ABORT_LIMIT=1000
       - WAZUH_IGNORE_OWN_ENTITIES=false
@@ -44,15 +47,16 @@ services:
       - WAZUH_MAX_TLP=TLP:RED
       - WAZUH_OPENSEARCH_EXCLUDE_MATCH=data.integration:opencti
       - WAZUH_OPENSEARCH_FILTER=
+      - "WAZUH_OPENSEARCH_TIMEOUT=20 seconds"
       - WAZUH_OPENSEARCH_INCLUDE_MATCH=
       - WAZUH_OPENSEARCH_INDEX=wazuh-alerts-*
-      - WAZUH_OPENSEARCH_LIMIT=50
+      - WAZUH_OPENSEARCH_LIMIT=200
       - WAZUH_OPENSEARCH_ORDER_BY=timestamp:desc
       - "WAZUH_OPENSEARCH_PASSWORD=SecretPassword" # Remember double-$ if password contains $:
       - "WAZUH_OPENSEARCH_SEARCH_AFTER=7 months ago" # No limit can cause search errors, especially with regexp queries (possibly mitigated by increasing indices.query.bool.max_clause_count)
       - WAZUH_OPENSEARCH_URL=https://mywazuh.example.org:9200
       - WAZUH_OPENSEARCH_USERNAME=cti_connector
-      - WAZUH_OPENSEARCH_VERIFY_TLS=true
+      - WAZUH_OPENSEARCH_VERIFY_TLS=false # Set this to true if you are using a proper certificate in OpenSearch
       - WAZUH_REQUIRE_INDICATOR_DETECTION=false
       - WAZUH_REQUIRE_INDICATOR_FOR_INCIDENTS=true
       - WAZUH_SEARCH_DIRSEARCH_OPTIONS=allow-regexp,case-insensitive,ignore-trailing-slash,match-subdirs,search-filenames
@@ -67,11 +71,6 @@ services:
       - WAZUH_SEARCH_PROCSEARCH_OPTIONS=case-insensitive
       - WAZUH_SYSTEM_NAME="Wazuh SIEM"
       - WAZUH_TLPS=TLP:AMBER+STRICT
-      - WAZUH_VULNERABILITY_INCIDENT_CVSS3_SCORE_THRESHOLD=
-    volumes:
-      - /var/cache/wazuh
-    links:
-      - opencti:opencti
     # Set a limit on logs:
     logging:
       options:

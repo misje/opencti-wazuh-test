@@ -2,9 +2,10 @@ import json
 import stix2
 import ipaddress
 import logging
+import re
+import time
 from .config import Config
 from .opensearch import OpenSearchClient
-from .wazuh_api import WazuhAPIClient
 from pycti import (
     CaseIncident,
     CustomObjectCaseIncident,
@@ -19,18 +20,28 @@ from pycti import (
 )
 from typing import Any, Final
 from datetime import datetime
-from urllib.parse import urljoin
 from functools import reduce
+from .describer import Describer, DescriberConfig
 from .utils import (
+    cvss3_severity_to_score,
     datetime_string,
+    escape_markdown,
     field_or_default,
+    field_or_empty,
     has,
     lists_or_empty,
+    md_table,
+    nonempty_field_or_default,
+    obj_to_md_table,
+    remove_newlines,
     rule_level_to_severity,
     priority_from_severity,
     max_severity,
     common_prefix_string,
+    search_field,
+    search_fields,
     search_in_object_multi,
+    truncate_string,
 )
 from .stix_helper import (
     # SCO,
@@ -49,32 +60,6 @@ from .sightings import SightingsCollector
 from .search import AlertSearcher
 from .enrich import Enricher
 
-# TODO: Replace ValueError with a better named exception if it is no longer a value error
-# TODO: update wazuh api completely in background
-# TODO: escape_md() function (for use in all text going into opencti)
-# TODO: Use TypeAlias (from typing) for things like Bundle, SCO etc.
-# TODO: Alert notes in incidents (already in sighting and case, but not incident)
-# TODO: aws, google and office
-# - user accounts
-# - emails
-# - files
-# - directories
-# TODO: Identities for AWS, GitHub, Office365, etc.(?)
-# TODO: Rule_id ignore list
-
-# Notes:
-# - get_config_variable with required doesn't throw if not set. Resolved by
-#   using Field in the future
-# - Using automation, observables can be created from indicator
-# - for config, consider using pydanic and BaseSettings. Look at
-# https://github.com/OpenCTI-Platform/connectors/blob/abf07fb6bd423c104a10207626520c2836d7e586/internal-enrichment/shodan-internetdb/src/shodan_internetdb/config.py#L26.
-# If not, ensure empty values in required throws
-# - Experiment with custom STIX patterns, like [syscheck.path:value = …] to
-# create opensearch queries? Look into qualifiers in the STIX standard
-
-
-# UUID_RE = r"^a[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$"
-# STIX_ID_REGEX = re.compile(f".+--{UUID_RE}", re.IGNORECASE)
 
 log = logging.getLogger(__name__)
 
@@ -100,35 +85,75 @@ def parse_incident_create_threshold(threshold: str | int | None) -> int:
             raise ValueError(f"WAZUH_INCIDENT_CREATE_THRESHOLD is invalid: {threshold}")
 
 
-def alert_md_table(alert: dict, additional_rows: list[tuple[str, str]] | None = None):
+def vulnerability_active(sightings: SightingsCollector) -> bool:
     """
-    Create a markdown table with key Wazuh alert information
-
-    Any additional rows can be appended to the table using additional_rows.
+    Whether the vulnerability found is no longer present in the systems it was
+    sighted
     """
-    s = alert["_source"]
-    if additional_rows is None:
-        additional_rows = []
+    # Create a dict with sighter (system ID) as keys, and a dict with alert
+    # rule ID and "last seen" timestamps:
+    last_seen = {
+        sighter: {
+            rule_id: max((a["_source"]["@timestamp"] for a in alerts))
+            for rule_id, alerts in meta.alerts.items()
+            if alerts
+        }
+        for sighter, meta in sightings.collated().items()
+    }
+    # Create a map of when vulnerabilities were last seen per system:
+    active = {
+        sighter: timestamp
+        for sighter, rs in last_seen.items()
+        for rule_id, timestamp in rs.items()
+        if rule_id in ("23503", "23504", "23505", "23506")
+    }
+    # Create a map of when vulnerabilities were last resolved (a patch was
+    # installed, the program was removed etc.) per system:
+    resolved = {
+        sighter: timestamp
+        for sighter, rs in last_seen.items()
+        for rule_id, timestamp in rs.items()
+        if rule_id == "23502"
+    }
+    # List systems with vulnerabilities still installed:
+    sighters_with_unresolved = {
+        sighter
+        for sighter in active.keys()
+        if sighter not in resolved or resolved[sighter] < active[sighter]
+    }
+    return bool(sighters_with_unresolved)
 
-    return (
-        "|Key|Value|\n"
-        "|---|-----|\n"
-        f"|Rule ID|{s['rule']['id']}|\n"
-        f"|Rule desc.|{s['rule']['description']}|\n"
-        f"|Rule level|{s['rule']['level']}|\n"
-        f"|Alert ID|{alert['_id']}/{s['id']}|\n"
-    ) + "".join(f"|{key}|{value}|\n" for key, value in additional_rows)
+
+def cvss3_from_alert(alerts: list[dict], cve: str) -> dict[str, str | float]:
+    """
+    Extract CVSS3 metadata from vulnerability alerts
+
+    Examples:
+
+    >>> cvss3_from_alert([{'_source': {'data': {'vulnerability': {'cve': 'CVE-2020-1234', 'severity': 'high'}}}}, {'_source': {'data': {'vulnerability': {'cve': 'CVE-2020-1234', 'severity': '', 'cvss': {'cvss3': {'base_score': 9.9}}}}}}], 'CVE-2020-1234')
+    {'data.vulnerability.severity': 'high', 'data.vulnerability.cvss.cvss3.base_score': 9.9}
+    """
+    return {
+        field: value
+        for alert in alerts
+        if search_field(alert["_source"], "data.vulnerability.cve", regex=cve)
+        for field, value in search_fields(
+            alert["_source"],
+            [
+                "data.vulnerability.cvss.cvss3.base_score",
+                "data.vulnerability.severity",
+            ],
+        ).items()
+        if value
+    }
 
 
-def api_searchable_entity_type(entity_type: str):
-    match entity_type:
-        # case "IPv4-Addr" | "IPv6-Addr":
-        # case "Network-Traffic":
-        # case "Process":
-        case "Software":
-            return True
-        case _:
-            return False
+def cvss3_score_from_alert(alerts: list[dict], cve: str, default: float) -> float:
+    result = cvss3_from_alert(alerts, cve).get(
+        "data.vulnerability.cvss.cvss3.base_score"
+    )
+    log.debug(f"Looking up CVSS3 base score from alerts: {result}")
+    return float(result) if result is not None else default
 
 
 class WazuhConnector:
@@ -147,7 +172,7 @@ class WazuhConnector:
                 self.metric.inc("client_error_count")
 
     def __init__(self, config: Config):
-        self.CONNECTOR_VERSION: Final[str] = "0.0.1"
+        self.CONNECTOR_VERSION: Final[str] = "__CONNECTOR_VERSION__"
 
         self.conf = config
         self.helper = OpenCTIConnectorHelper(
@@ -159,21 +184,21 @@ class WazuhConnector:
             },
             True,
         )
-        log.info(f"DUMP: {config.model_dump(mode='json')['opencti']}")
-        log.info(f"OPENCTI URL: {self.helper.opencti_url}")
-
-        # FIXME: deprecated: remove and don't set confidence:
-        self.confidence = (
-            int(self.helper.connect_confidence_level)
-            if isinstance(self.helper.connect_confidence_level, int)
-            else None
+        self.describer = Describer(
+            # Describer's config is designed to copy all relevant settings by
+            # path from the main configuration:
+            config=DescriberConfig.model_validate(self.conf.model_dump())
         )
+
         self.stix_common_attrs = {
             "object_marking_refs": self.conf.tlps,
-            "confidence": self.confidence,
+            # The connector should not need to set the confidence explicltly,
+            # but due to #6835(?), this doesn't seem to work for sightings.
+            # This confidence will be lowered to that of the connector's user
+            # or group memberships:
+            "confidence": 100,
         }
         # Add moe useful meta to author?
-        # TODO: a different type than an org.?
         self.author = stix2.Identity(
             id=Identity.generate_id("Wazuh", "system"),
             **self.stix_common_attrs,
@@ -191,6 +216,7 @@ class WazuhConnector:
             helper=self.helper,
             stix=self.stix,
             config=self.conf.enrich,
+            describer=self.describer,
         )
         self.siem_system = stix2.Identity(
             id=Identity.generate_id(self.conf.system_name, "system"),
@@ -198,26 +224,13 @@ class WazuhConnector:
             name=self.conf.system_name,
             identity_class="system",
         )
-        self.app_url = str(self.conf.app_url)
         self.alert_searcher = AlertSearcher(
             helper=self.helper,
             opensearch=OpenSearchClient(config=self.conf.opensearch),
             config=self.conf.search,
         )
-        if self.conf.api.enabled:
-            self.wazuh = WazuhAPIClient(
-                config=self.conf.api,
-                cache_filename="/var/cache/wazuh/state.json",
-            )
-        else:
-            self.wazuh = None
 
     def start(self):
-        if self.wazuh:
-            self.wazuh.load_cache()
-            self.wazuh.query_packages()
-            self.wazuh.save_cache()
-
         self.enricher.fetch_tools()
         self.helper.metric.state("idle")
         self.helper.listen(self.process_message)
@@ -235,14 +248,20 @@ class WazuhConnector:
             entity_type = "vulnerability"
         # Support looking up observables based on indicatorss:
         elif data["entity_id"].startswith("indicator--"):
+            log.info(
+                "Waiting a little while for indicator 'based-on' relationships to be ingested before processing"
+            )
+            time.sleep(0.1)
             ind = self.helper.api.indicator.read(id=data["entity_id"])
             ind_obs = ind["observables"] if ind and "observables" in ind else []
+            log.debug(f"Ind. obs.: {ind_obs}")
             # TODO: In some distant feature, with a STIX shifter implementation
             # for Wazuh, look up the STIX pattern in the indicator and use that
-            # in a search.
+            # in a search (#9).
             # TODO: alternatively, add OpenSearch DSL as a custom pattern_type_ov and use something like mitre/stix2patterns_translator to convert int o elastic_query
             if not ind_obs:
-                raise ValueError("Indicator is not based on any observables")
+                # FIXME: Not an error: just print as message. Throw a custom exception for messages?
+                return "Indicator is not based on any observables"
             elif (count := len(ind_obs)) > 1:
                 log.warning(
                     f"Indicator is based on several observables; using the first out of {count}"
@@ -266,7 +285,6 @@ class WazuhConnector:
             and has(entity, ["createdBy", "standard_id"])
             and entity["createdBy"]["standard_id"] == self.author.id
         ):
-            # TODO: How to allow manual enrichments? Any way to separate automatic enrichments from manual?
             return f"Ignoring entity because it was created by {self.author.name}"
 
         # Figure out exactly what this does (change id format?);
@@ -302,15 +320,6 @@ class WazuhConnector:
             )
             return "Observable has no indicators"
 
-        if api_searchable_entity_type(entity["entity_type"]):
-            if not self.wazuh:
-                log.info(
-                    f'Cannot search for {entity["entity_type"]} because WAZUH_API_USE is false'
-                )
-            else:
-                self._query_api(entity, stix_entity)
-
-        # TODO: If StixFile, extract path from parent_directory_ref:
         result = self.alert_searcher.search(entity=entity, stix_entity=stix_entity)
         if result is None:
             # Even though the entity is supported (an exception is throuwn
@@ -321,12 +330,9 @@ class WazuhConnector:
 
         if result["_shards"]["failed"] > 0:
             for failure in result["_shards"]["failures"]:
-                # TODO: raise query failure in opensearch class (make optional
-                # through setting, especially if hits are non-empty):
                 log.error(f"Query failure: {failure}")
 
         hits = result["hits"]["hits"]
-        # TODO: optionally include enrichment summary even if no hits:
         if not hits:
             return "No hits found"
 
@@ -348,6 +354,11 @@ class WazuhConnector:
         for hit in hits:
             try:
                 s = hit["_source"]
+                if rule_id := s["rule"]["id"] in self.conf.rule_exclude_list:
+                    log.info(
+                        f"Ignoring alert rule id {rule_id} because it is in rule_exclude_list"
+                    )
+                    continue
                 if (
                     has(s, ["agent", "id"])
                     and self.conf.agents_as_systems
@@ -372,54 +383,18 @@ class WazuhConnector:
         bundle += list(agents.values())
         bundle += self.relate_agents_to_siem(list(agents.values()), self.siem_system)
 
-        # TODO: Use in incident and add as targets(?):
         if self.conf.create_agent_ip_observable:
             bundle += self.create_agent_addr_obs(alerts=hits)
         if self.conf.create_agent_hostname_observable:
             bundle += self.create_agent_hostname_obs(alerts=hits)
 
-        # TODO: doesn't seem to work? Or bug in OpenCTI. Anyway, add STIXList
-        # as type hint to bundle everywhere before continuing working on this:
-        # bundle = add_incidents_to_note_refs(bundle)
-
-        # FIXME: WAZUH_INCIDENT_CREATE_MODE=per_sighting produces missing ref
-        # errors unless dummy indicator exists. Update: might be random and
-        # unrelated.
         sighting_ids = []
         for sighter_id, meta in sightings_collector.collated().items():
-            sighting = self.create_sighting_stix(sighter_id=sighter_id, metadata=meta)
-            sighting_ids.append(sighting.id)
-            bundle += [sighting] + self.create_sighting_alert_notes(
-                entity=entity, sighting_id=sighting.id, metadata=meta
+            sighting = self.create_sighting_stix(
+                entity=entity, sighter_id=sighter_id, metadata=meta
             )
-
-        ###############
-        # hostname seems to be the target, not a system
-        # relation "uses" on attack pattern (mitre)
-        #
-        # Issues:
-        #   When creating alerts, double alerts is an issue when rule engine is enabled
-        #   The indicator is not available yet when working with the observable (timing issue)
-        # Setting: incident for sightings in obs
-        # Setting: Incident for sightings in obs with indicator
-        # Setting: One incident per alert rule.id
-        # Setting: Include rule ids, exclude rule ids
-        # Setting: Agents as hostnames
-        # Setting: Agent IP as observable
-        # Setting: max_ext_ref per rule_id, per search?. same for note
-        # Setting for limiting notes per sighting (0 disables notes for sightings)
-        # Setting for limiting ext.refs. per sighting (0 disables)
-        # Setting for adhering to detection, valid_until, min score(?)
-        #
-        # Create external reference to wazuh with the query that was ran (discover? custom columns?)
-        # Look into how playbooks can be used
-        # Add mitre connector and import tactics etc.
-        # Look through wazuh rules to find occurances of usernames, addresses etc.
-        ###############
-
-        alerts_by_rule_id = sightings_collector.alerts_by_rule_id()
-        counts = {rule_id: len(alerts) for rule_id, alerts in alerts_by_rule_id.items()}
-        log.debug(f"COUNTS: {counts}")
+            sighting_ids.append(sighting.id)
+            bundle += [sighting]
 
         if (
             self.conf.require_indicator_for_incidents
@@ -429,14 +404,33 @@ class WazuhConnector:
             log.info(
                 "Not creating incident because entity is an observable, an indicator is required and no indicators are found"
             )
-        elif entity_type == "vulnerability" and not (
+        elif entity_type == "vulnerability" and (
             (score_threshold := self.conf.vulnerability_incident_cvss3_score_threshold)
-            is not None
-            and field_or_default(stix_entity, "x_openti_cvss_base_score", 11)
-            > score_threshold
+            is None
+            # First match against the actual CVSS3 score:
+            or field_or_default(
+                stix_entity,
+                "x_opencti_cvss_base_score",
+                cvss3_severity_to_score(
+                    field_or_default(stix_entity, "x_opencti_cvss_base_severity", ""),
+                    # As a last resort, try to get the score from searching alerts:
+                    default=cvss3_score_from_alert(
+                        alerts=hits, cve=stix_entity["name"], default=0.0
+                    ),
+                ),
+            )
+            < score_threshold
         ):
             log.info(
-                "Not creating incident because entity is an indicator, and CVSS3 score is not present, threshold is not set, or threshold is no met"
+                "Not creating incident because entity is a vulnerability, and CVSS3 score is not present, threshold is not set, or threshold is not met"
+            )
+        elif (
+            entity_type == "vulnerability"
+            and self.conf.vulnerability_incident_active_only
+            and not vulnerability_active(sightings_collector)
+        ):
+            log.info(
+                "Not creating incident because entity is a vulnerability, vulnerability_incident_active_only is enabled, and the vulnerability is no longer present"
             )
         else:
             bundle += self.create_incidents(
@@ -461,12 +455,25 @@ class WazuhConnector:
         ]
 
         # NOTE: This must be the lastly created bundle, because it references
-        # all other objects in the bundle list:
+        # all other objects in the bundle list (excluding notes, since they
+        # reference entities internally):
         if self.conf.create_incident_response and any(
             isinstance(obj, stix2.Incident) for obj in bundle
         ):
             bundle += self.create_incident_response_case(
                 entity=entity, indicators=obs_indicators, result=result, bundle=bundle
+            )
+
+        for sighter_id, meta in sightings_collector.collated().items():
+            bundle += self.create_alert_notes(
+                entity=entity,
+                refs=[sighter_id]
+                + [
+                    obj.id
+                    for obj in bundle
+                    if isinstance(obj, (stix2.Incident, CustomObjectCaseIncident))
+                ],
+                alerts=meta.alerts,
             )
 
         if (
@@ -516,23 +523,6 @@ class WazuhConnector:
 
         return True
 
-    def _query_api(self, entity: dict, stix_entity: dict):
-        # TODO: handle results. Refactor this file first
-        # TODO: Ideally log a message that WAZUH_API_USE is false if a
-        # supported, and raise ValueError if non-supported entity is passed
-        if not self.wazuh:
-            return None
-        match entity["entity_type"]:
-            case "Software":
-                results = self.wazuh.find_package(
-                    stix_entity["name"], stix_entity.get("version")
-                )
-                log.debug(results)
-                # for (agent, package) in results:
-
-            case _:
-                return None
-
     def create_agent_stix(self, alert):
         s = alert["_source"]
         agent_id = s["agent"]["id"]
@@ -560,29 +550,20 @@ class WazuhConnector:
         ]
 
     def generate_agent_md_tables(self, agent_id: str):
-        if (
-            self.wazuh
-            and agent_id in self.wazuh.state.agents
-            and self.conf.enrich_agent
-        ):
-            agent = self.wazuh.state.agents[agent_id]
-            return (
-                "|Key|Value|\n"
-                "|---|-----|\n"
-                f"|ID|{agent.id}|\n"
-                f"|Name|{agent.name}|\n"
-                f"|Status|{agent.status if agent.status is not None else ''}|\n"
-                f"|OS name|{agent.os.name if agent.os is not None else ''}|\n"
-                f"|OS version|{agent.os.version if agent.os is not None else ''}|\n"
-                f"|Agent version|{agent.version}|\n"
-                f"|IP address|{agent.ip}|\n"
-            )
-        else:
-            return "|Key|Value|\n" "|---|-----|\n" f"|ID|{agent_id}|\n"
+        return "|Key|Value|\n" "|---|-----|\n" f"|ID|{agent_id}|\n"
 
     def create_sighting_stix(
-        self, *, sighter_id: str, metadata: SightingsCollector.Meta
+        self, *, entity: dict, sighter_id: str, metadata: SightingsCollector.Meta
     ):
+        alert_md_list = "\n".join(
+            f"- {self.describer.alert_rule_md_link(rule_id)}: {rule_desc}"
+            for rule_id, alerts in metadata.alerts.items()
+            for rule_desc in (
+                common_prefix_string(
+                    [alert["_source"]["rule"]["description"] for alert in alerts]
+                ),
+            )
+        )
         return stix2.Sighting(
             id=StixSightingRelationship.generate_id(
                 metadata.observable_id,
@@ -594,11 +575,11 @@ class WazuhConnector:
             first_seen=metadata.first_seen,
             last_seen=metadata.last_seen,
             count=metadata.count,
+            description=f"{entity_name_value(entity)} has been sighted in Wazuh in the following alerts:\n\n{alert_md_list}",
             where_sighted_refs=[sighter_id],
             # Use a dummy indicator since this field is required:
             sighting_of_ref=DUMMY_INDICATOR_ID,
             custom_properties={"x_opencti_sighting_of_ref": metadata.observable_id},
-            # FIXME: External references has stopped working (takes a second enrichment run):
             external_references=self.create_sighting_ext_refs(metadata=metadata),
         )
 
@@ -617,25 +598,22 @@ class WazuhConnector:
     def create_alert_ext_ref(self, *, alert):
         return stix2.ExternalReference(
             source_name="Wazuh alert",
-            description=alert_md_table(alert),
-            url=urljoin(
-                self.app_url,
-                f'app/discover#/context/wazuh-alerts-*/{alert["_id"]}?_a=(columns:!(_source),filters:!())',
-            ),
+            description=self.describer.alert_md_table(alert),
+            url=self.describer.alert_context_link(alert),
         )
 
-    def create_sighting_alert_notes(
-        self, *, entity: dict, sighting_id: str, metadata: SightingsCollector.Meta
+    def create_alert_notes(
+        self, *, entity: dict, alerts: dict[str, list[dict]], refs: list[str]
     ):
         note_count = 0
         return [
             self.create_alert_note(
                 entity=entity,
-                sighting_id=sighting_id,
+                refs=refs,
                 alert=alert,
                 limit_info=capped_at,
             )
-            for alerts in metadata.alerts.values()
+            for alerts in alerts.values()
             # In addition to limit the total number of external references,
             # also limit them per alert rule (pick the last N alerts to get
             # the latest alerts):
@@ -652,7 +630,7 @@ class WazuhConnector:
         self,
         *,
         entity: dict,
-        sighting_id,
+        refs: list[str],
         alert,
         limit_info: tuple[int, int, int] | None,
     ):
@@ -678,8 +656,9 @@ class WazuhConnector:
             created=sighted_at,
             **self.stix_common_attrs,
             abstract=f"""Wazuh alert "{s['rule']['description']}" for sighting at {sighted_at}""",
+            # TODO: Move into Describer, a generic md table creator with proper escaping:
             content="## Summary\n\n"
-            + alert_md_table(alert, capped_info)
+            + self.describer.alert_md_table(alert, capped_info)
             + (
                 "\n\n"
                 # These matches do not reflect how the query matched, but it is still useful:
@@ -688,17 +667,19 @@ class WazuhConnector:
                 "|Field|Match|\n"
                 "|-----|-----|\n"
                 + "".join(
-                    f"|{field}|{match}|\n"
+                    f"|{escape_markdown(field)}|{escape_markdown(match_formatted)}|\n"
                     for field, match in search_in_object_multi(
                         alert["_source"], *obs_values, exclude_fields=["full_log"]
                     ).items()
+                    # Remove all newline characters and limit the string to a
+                    # sensible length:
+                    for match_formatted in (truncate_string(remove_newlines(match)),)
                 )
                 + "\n\n"
                 "## Alert\n"
-                "\n\n"
-                f"```json\n{alert_json}\n```"
+                "\n\n" + obj_to_md_table(s)
             ),
-            object_refs=[entity["standard_id"], sighting_id],
+            object_refs=[entity["standard_id"]] + refs,
             external_references=[self.create_alert_ext_ref(alert=alert)],
             allow_custom=True,
             note_types=["analysis"],
@@ -716,8 +697,7 @@ class WazuhConnector:
         abstract = f"Wazuh enrichment at {run_time_string}"
         hits_returned = len(result["hits"]["hits"])
         total_hits = result["hits"]["total"]["value"]
-        # TODO: link to query if a link to opensearch is possible
-        # TODO: include "filter" and exclude search_after/{include,exclude}_match if so:
+        # TODO: link to query if a link to opensearch is possible (#68)
         content = (
             "## Wazuh enrichment summary\n"
             "\n\n"
@@ -739,7 +719,7 @@ class WazuhConnector:
             "|Rule|Level|Count|Earliest|Latest|Description|\n"
             "|----|-----|-----|--------|------|-----------|\n"
         ) + "".join(
-            f"[{rule_id}]({self.alert_rule_link(rule_id)})|{level}|{len(alerts)}{'+' if total_hits > hits_returned else ''}|{sightings_meta.first_seen(rule_id)}|{sightings_meta.last_seen(rule_id)}|{rule_desc}|\n"
+            f"{self.describer.alert_rule_md_link(rule_id)}|{level}|{len(alerts)}{'+' if total_hits > hits_returned else ''}|{sightings_meta.first_seen(rule_id)}|{sightings_meta.last_seen(rule_id)}|{rule_desc}|\n"
             for rule_id, alerts in sightings_meta.alerts_by_rule_id().items()
             for level in (alerts[0]["_source"]["rule"]["level"],)
             for rule_desc in (
@@ -760,6 +740,7 @@ class WazuhConnector:
             note_types=["analysis"],
         )
 
+    # TODO: Refactor – too long and repetitive!
     def create_incidents(
         self,
         *,
@@ -768,9 +749,15 @@ class WazuhConnector:
         result: dict,
         sightings_meta: SightingsCollector,
     ):
-        def log_skipped_incident_creation(level: int):
+        def log_skipped_due_to_rule_level(level: int):
             log.info(
                 f"Not creating incident because rule level below threshold: {level} < {self.conf.create_incident_threshold}"
+            )
+            return True
+
+        def log_skipped_due_to_rule():
+            log.info(
+                "Not creating incident because rule ID is in incident_rule_exclude_list"
             )
             return True
 
@@ -782,14 +769,26 @@ class WazuhConnector:
         query_hits_dropped = (
             len(result["hits"]["hits"]) < result["hits"]["total"]["value"]
         )
-        # TODO:
-        # severity = cvss3_to_severity(alert entity['entity_type'] == 'Vulnerability'
+        # TODO: (#69)
+        # severity = cvss3_score_to_severity(alert entity['entity_type'] == 'Vulnerability'
+        # TODO: use more info than just rule level to determine severity. And
+        # use a customiseable severity level as a minimum instead of ending up
+        # with a low level due to FIM etc.
         match self.conf.create_incident:
             case Config.IncidentCreateMode.PerQuery:
                 if (
                     level := sightings_meta.max_rule_level()
                 ) < self.conf.create_incident_threshold:
-                    log_skipped_incident_creation(level)
+                    log_skipped_due_to_rule_level(level)
+                    return []
+                if self.conf.incident_rule_exclude_list and all(
+                    (
+                        alert["_source"]["rule"]["id"]
+                        in self.conf.incident_rule_exclude_list
+                        for alert in sightings_meta.alerts()
+                    )
+                ):
+                    log_skipped_due_to_rule()
                     return []
 
                 incident_name = f"Wazuh alert: {entity_name_value(entity)} sighted"
@@ -801,7 +800,7 @@ class WazuhConnector:
                     **self.stix_common_attrs,
                     incident_type="alert",
                     name=incident_name,
-                    description=f"Observable {entity_name_value(entity)} has been sighted a total of {total_sightings}{'+' if query_hits_dropped else ''} time(s) in {total_systems} system(s)",
+                    description=f"{entity_name_value(entity)} has been sighted a total of {total_sightings}{'+' if query_hits_dropped else ''} time(s) in {total_systems} system(s)",
                     allow_custom=True,
                     # The following are extensions:
                     severity=rule_level_to_severity(sightings_meta.max_rule_level()),
@@ -828,7 +827,15 @@ class WazuhConnector:
                     if (
                         level := meta.max_rule_level
                     ) < self.conf.create_incident_threshold:
-                        log_skipped_incident_creation(level)
+                        log_skipped_due_to_rule_level(level)
+                        continue
+                    if self.conf.incident_rule_exclude_list and all(
+                        (
+                            rule_id in self.conf.incident_rule_exclude_list
+                            for rule_id in meta.alerts.keys()
+                        )
+                    ):
+                        log_skipped_due_to_rule()
                         continue
 
                     incident_name = f"Wazuh alert: {entity_name_value(entity)} sighted in {meta.sighter_name}"
@@ -838,7 +845,7 @@ class WazuhConnector:
                         **self.stix_common_attrs,
                         incident_type="alert",
                         name=incident_name,
-                        description=f"Observable {entity_name_value(entity)} has been sighted {meta.count}{'+' if query_hits_dropped else ''} time(s) in {meta.sighter_name}",
+                        description=f"{entity_name_value(entity)} has been sighted {meta.count}{'+' if query_hits_dropped else ''} time(s) in {meta.sighter_name}",
                         allow_custom=True,
                         # The following are extensions:
                         severity=rule_level_to_severity(meta.max_rule_level),
@@ -863,10 +870,17 @@ class WazuhConnector:
 
             case Config.IncidentCreateMode.PerAlertRule:
                 for rule_id, meta in sightings_meta.alerts_by_rule_id_meta().items():
+                    if (
+                        self.conf.incident_rule_exclude_list
+                        and rule_id in self.conf.incident_rule_exclude_list
+                    ):
+                        log_skipped_due_to_rule()
+                        continue
+
                     # Alerts are grouped by ID and all have the same level, so just pick one:
                     alerts_level = meta["alerts"][0]["_source"]["rule"]["level"]
                     if alerts_level < self.conf.create_incident_threshold:
-                        log_skipped_incident_creation(alerts_level)
+                        log_skipped_due_to_rule_level(alerts_level)
                         continue
 
                     incident_name = f"Wazuh alert: {entity_name_value(entity)} sighted"
@@ -884,7 +898,7 @@ class WazuhConnector:
                         **self.stix_common_attrs,
                         incident_type="alert",
                         name=incident_name,
-                        description=f"""Observable {entity_name_value(entity)} has been sighted {len(meta['alerts'])}{'+' if query_hits_dropped else ''} time(s) in alert rule {rule_id}: "{alerts_desc}\"""",
+                        description=f"""{entity_name_value(entity)} has been sighted {len(meta['alerts'])}{'+' if query_hits_dropped else ''} time(s) in alert rule {rule_id}: "{alerts_desc}\"""",
                         allow_custom=True,
                         # The following are extensions:
                         severity=rule_level_to_severity(alerts_level),
@@ -903,62 +917,6 @@ class WazuhConnector:
                     bundle += self.enricher.enrich_incident(
                         incident=incident, alerts=[alert for alert in meta["alerts"]]
                     )
-
-            case Config.IncidentCreateMode.PerAlert:
-                for sighter_id, meta in sightings_meta.alerts_by_sighter_meta().items():
-                    incident_name = f"Wazuh alert: {entity_name_value(entity)} sighted in {meta['sighter_name']}"
-                    incidents = [
-                        stix2.Incident(
-                            id=Incident.generate_id(incident_name, sighted_at),
-                            created=sighted_at,
-                            **self.stix_common_attrs,
-                            incident_type="alert",
-                            name=incident_name,
-                            description=f"""Observable {entity_name_value(entity)} has been sighted in alert rule {rule_id}: "{rule_desc}\"""",
-                            allow_custom=True,
-                            # The following are extensions:
-                            severity=rule_level_to_severity(rule_level),
-                            first_seen=sighted_at,
-                            last_seen=sighted_at,
-                            source=self.conf.system_name,
-                        )
-                        for alert in meta["alerts"]
-                        for sighted_at in (alert["_source"]["@timestamp"],)
-                        for rule_id in (alert["_source"]["rule"]["id"],)
-                        for rule_desc in (alert["_source"]["rule"]["description"],)
-                        for rule_level in (alert["_source"]["rule"]["level"],)
-                        if (
-                            rule_level >= self.conf.create_incident_threshold
-                            # Just a hack to log some info:
-                            or not log_skipped_incident_creation(rule_level)
-                        )
-                    ]
-
-                    bundle += incidents
-
-                    for incident in incidents:
-                        bundle += self.create_incident_relationships(
-                            incident=incident,
-                            entity=entity,
-                            obs_indicators=obs_indicators,
-                            sighters=[sighter_id],
-                        )
-
-                    # TODO: Implement (this solution doesn't work):
-                    # bundle += [
-                    #    enrichment
-                    #    for filtered_alerts in [
-                    #        alert
-                    #        for alert in meta["alerts"]
-                    #        if alert["_source"]["rule"]["level"]
-                    #        >= self.conf.create_incident_threshold
-                    #    ]
-                    #    for pair in zip(incidents, filtered_alerts, strict=True)
-                    #    for incident, alerts in (pair,)
-                    #    for enrichment in self.enricher.enrich_incident(
-                    #        incident=incident, alerts=alerts
-                    #    )
-                    # ]
             case Config.IncidentCreateMode.Never:
                 return []
 
@@ -1054,9 +1012,11 @@ class WazuhConnector:
             CustomObjectCaseIncident(
                 id=CaseIncident.generate_id(name, timestamp),
                 name=name,
-                # TODO: include info from Notes (not included in bundle?):
-                description=f"Observable {entity_name_value(entity)} {ind_info} has been sighted {f'at least {sightings_count}' if hits_dropped else f'{sightings_count}'} times(s)",
-                # TODO: this may break if user changes case_severity_ov. Make customisable from setting
+                # description=f"{entity_name_value(entity)} {ind_info} has been sighted {f'at least {sightings_count}' if hits_dropped else f'{sightings_count}'} times(s)",
+                description=self.describer.ir_case_desc(
+                    entity=entity, indicators=indicators, result=result, bundle=bundle
+                ),
+                # NOTE: this may break if user changes case_severity_ov. Make customisable from setting(?)
                 severity=severity,
                 priority=priority_from_severity(severity),
                 **self.stix_common_attrs,
@@ -1076,23 +1036,6 @@ class WazuhConnector:
             for agent in (alert["_source"]["agent"],)
             if int(agent["id"]) > 0 and "ip" in agent
         }
-        if self.wazuh and self.conf.enrich_agent:
-            for agent_id, agent in agents.copy().items():
-                if agent_id in self.wazuh.state.agents:
-                    api_agent = self.wazuh.state.agents[agent_id].model_dump(
-                        include={"name", "ip", "scan_time"}
-                    )
-                    # The agent has changed its address at some point in time.
-                    # Add the new address as well:
-                    if api_agent["ip"] != agent["ip"]:
-                        # Createa new key to be able to add the new agent metadata:
-                        agents[agent_id + str(api_agent["ip"])] = api_agent | {
-                            "standard_id": agent["standard_id"],
-                            "is_new": True,
-                        }
-                    else:
-                        # Add new metadata:
-                        agents[agent_id] |= api_agent
 
         bundle = []
         earliest = min(alert["_source"]["@timestamp"] for alert in alerts)
@@ -1149,22 +1092,6 @@ class WazuhConnector:
             for agent in (alert["_source"]["agent"],)
             if int(agent["id"]) > 0
         }
-        if self.wazuh and self.conf.enrich_agent:
-            for agent_id, agent in agents.copy().items():
-                if agent_id in self.wazuh.state.agents:
-                    api_agent = self.wazuh.state.agents[agent_id].model_dump(
-                        include={"name", "scan_time"}
-                    )
-                    # The agent has changed hostname at some point in time. Add
-                    # the new hostname as well:
-                    if api_agent["name"] != agent["name"]:
-                        # Createa new key to be able to add the new agent metadata:
-                        agents[agent_id + api_agent["name"]] = api_agent | {
-                            "standard_id": agent["standard_id"]
-                        }
-                    else:
-                        # Add new metadata:
-                        agents[agent_id] |= api_agent
 
         bundle = []
         earliest = min(alert["_source"]["@timestamp"] for alert in alerts)
@@ -1207,9 +1134,3 @@ class WazuhConnector:
             bundle.append(rel)
 
         return bundle
-
-    def alert_rule_link(self, rule_id: str) -> str:
-        return urljoin(
-            self.app_url,  # type: ignore
-            f"app/wazuh#/manager/?tab=rules&redirectRule={rule_id}",
-        )

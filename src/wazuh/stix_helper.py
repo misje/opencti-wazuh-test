@@ -173,8 +173,17 @@ def entity_value(entity: dict) -> str | None:
             name = oneof_nonempty("name", "x_opencti_additional_names", within=entity)
             if isinstance(name, list) and len(name):
                 return name[0]
+            elif name is not None:
+                return str(name)
             else:
-                return str(name) if name is not None else None
+                return next(
+                    (
+                        h["hash"]
+                        for h in entity.get("hashes", [])
+                        if h["algorithm"] in ["SHA-256", "SHA-1", "MD5"]
+                    ),
+                    "",
+                )
         case "Directory":
             return oneof("path", within=entity)
         case "Process":
@@ -235,23 +244,6 @@ def incident_entity_relation_type(entity: dict):
             return "targets"
         case _:
             return "related-to"
-
-
-def add_refs_to_note(note: stix2.Note, objs: STIXList) -> stix2.Note:
-    # Don't use new_version(), because that requires a new modified
-    # timestamp (which must be newer than created):
-    return stix2.Note(
-        **{prop: getattr(note, prop) for prop in note if prop != "object_refs"},
-        object_refs=list(set(note.object_refs) | {obj.id for obj in objs}),
-    )
-
-
-def add_incidents_to_note_refs(bundle: STIXList) -> STIXList:
-    return [
-        add_refs_to_note(obj, incidents) if isinstance(obj, stix2.Note) else obj
-        for incidents in ([obj for obj in bundle if isinstance(obj, stix2.Incident)],)
-        for obj in bundle
-    ]
 
 
 def remove_unref_objs(bundle: STIXList) -> STIXList:

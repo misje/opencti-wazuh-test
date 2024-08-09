@@ -3,7 +3,7 @@ import stix2
 import re
 import dateparser
 import logging
-from pydantic import BaseModel, ConfigDict
+from pydantic import AnyUrl, BaseModel, ConfigDict
 from ntpath import basename
 from typing import Annotated, Any, Callable, Literal, Mapping
 from pycti import (
@@ -12,6 +12,7 @@ from pycti import (
     StixCoreRelationship,
     Vulnerability,
 )
+from wazuh.describer import Describer
 from .stix_helper import (
     STIXList,
     StixHelper,
@@ -46,6 +47,7 @@ from .utils import (
     simplify_field_names,
     parse_sha256,
     oneof,
+    raises,
     remove_empties,
 )
 from .enrich_config import EnrichmentConfig
@@ -55,7 +57,7 @@ log = logging.getLogger(__name__)
 EType = EnrichmentConfig.EntityType
 
 # TODO: Move a lot into stix_helper
-# TODO: set last_seen in related-to relationships
+# TODO: set stop_time in related-to relationships (tried this, no effect)
 
 # TODO: DO set/update descriptions (optionally?). As long as connector has
 # suitable confidence level, it will not overwrite existing descriptions.
@@ -99,12 +101,13 @@ class ProcessMeta(BaseModel):
 def infer_protos_from_alert(alert: dict) -> set[str]:
     protos = set()
 
-    if "sshd" in field_or_empty(alert, "rule.groups", list):
+    rule_groups = field_or_empty(alert, "rule.groups", list)
+    if "sshd" in rule_groups:
         protos.add("ssh")
-    if "smbd" in field_or_empty(alert, "rule.groups", []):
+    if "smbd" in rule_groups:
         protos.add("smb")
     if any(
-        keyword in field_or_empty(alert, "rule.groups", str)
+        keyword in rule_groups
         for keyword in ("ftpd", "msftp", "proftpd", "vsftpd", "pure-ftpd")
     ):
         protos.add("ftp")
@@ -119,6 +122,7 @@ class Enricher(BaseModel):
     )  # For OpenCTIConnectorHelper
     helper: OpenCTIConnectorHelper
     config: EnrichmentConfig
+    describer: Describer
     stix: StixHelper
     tools: list[stix2.Tool] = []
 
@@ -197,6 +201,7 @@ class Enricher(BaseModel):
                     id=StixCoreRelationship.generate_id(
                         "uses", incident.id, pattern.id
                     ),
+                    # TODO: description
                     created=alerts[0]["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="uses",
@@ -249,6 +254,7 @@ class Enricher(BaseModel):
             bundle += tools + [
                 stix2.Relationship(
                     id=StixCoreRelationship.generate_id("uses", incident.id, tool.id),
+                    # TODO: Description
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="uses",
@@ -327,16 +333,19 @@ class Enricher(BaseModel):
             alerts=alerts,
             sco_type="Url",
             fields=[
-                "data.url",
-                "data.osquery.columns.update_url",
+                "data.docker.Actor.Attributes.org.opencontainers.image.source",
                 "data.office365.MeetingURL",
                 "data.office365.MessageURLs",
                 "data.office365.RemoteItemWebUrl",
+                "data.osquery.columns.update_url",
+                "data.url",
             ],
             # MessageURLs is a list, so create a SCO for each entry:
             transform=(
                 lambda x: [(i, {}) for i in x] if isinstance(x, list) else [(x, {})]
             ),
+            validator=lambda x: self.config.enrich_urls_without_host
+            or not raises(lambda: AnyUrl(x)),
         )
 
     def enrich_email_addrs(self, *, incident: stix2.Incident, alerts: list[dict]):
@@ -358,12 +367,16 @@ class Enricher(BaseModel):
             incident=incident,
             alerts=alerts,
             sco_type="Directory",
+            # TODO: Tie to file in data.office365.SourceFileName as parent-dir
+            # (data.office365.SourceRelativeUrl):
             fields=[
                 "data.audit.directory.name",
                 "data.home",
+                "data.office365.SourceRelativeUrl",
                 "data.osquery.columns.directory",
                 "data.pwd",
             ],
+            validator=lambda x: x not in (".", ".."),
         )
 
     def enrich_files(self, *, incident: stix2.Incident, alerts: list[dict]):
@@ -398,6 +411,7 @@ class Enricher(BaseModel):
                             "data.audit.file.name",
                             "data.audit.file.name",
                             "data.file",
+                            "data.office365.SourceFileName",
                             "data.osquery.columns.path",
                             "data.sca.check.file",
                             "data.smbd.filename",
@@ -486,7 +500,12 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"StixFile {match} found in {meta['field']} in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type="StixFile",
+                        name=match,
+                        field=meta["field"],
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=sco_bundle.sco.id,
                 ),
@@ -541,7 +560,12 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"Windows-Registry-Key {match} found in {meta['field']} in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type="Windows-Registry-Key",
+                        name=match,
+                        field=meta["field"],
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=sco_bundle.sco.id,
                 ),
@@ -783,7 +807,10 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"Process found in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type="Process",
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=process.id,
                 ),
@@ -942,7 +969,10 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"Network-Traffic found in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type="Network-Traffic",
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=sco.id,
                 ),
@@ -1025,7 +1055,7 @@ class Enricher(BaseModel):
             )
             bundle += [vuln]
 
-            # enrich_software() will create softeare SCOs (if enabled). Create
+            # enrich_software() will create software SCOs (if enabled). Create
             # a ref to a software object to be used in a "has"
             # relationship, and only include it if that softeware object has
             # previously been created (honour
@@ -1042,7 +1072,9 @@ class Enricher(BaseModel):
                         description=fields["title"],
                         source_ref=sw_ref,
                         target_ref=vuln.id,
-                        start_time=dateparser.parse(fields["published"]),
+                        start_time=dateparser.parse(fields["published"])
+                        if "published" in fields
+                        else None,
                     ),
                 )
 
@@ -1112,7 +1144,12 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"{sco_type} {match} found in {meta['field']} in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type=sco_type,
+                        name=match,
+                        field=meta["field"],
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=sco_bundle.sco.id,
                 ),
@@ -1169,7 +1206,10 @@ class Enricher(BaseModel):
                     created=alert["_source"]["@timestamp"],
                     **self.stix.common_properties,
                     relationship_type="related-to",
-                    description=f"{sco_type} found in alert (ID {alert['_id']}, rule ID {alert['_source']['rule']['id']}): {alert['_source']['rule']['description']}",
+                    description=self.describer.enrichment_relation_desc(
+                        entity_type=sco_type,
+                        alert=alert,
+                    ),
                     source_ref=incident.id,
                     target_ref=sco.id,
                 ),

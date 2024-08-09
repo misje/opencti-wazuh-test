@@ -1,5 +1,6 @@
 import re
 from pydantic import (
+    AliasChoices,
     AnyUrl,
     AnyHttpUrl,
     Field,
@@ -12,12 +13,11 @@ from typing import Iterable
 from .opencti_config import OpenCTIConfig
 from .connector_config import ConnectorConfig
 from .search_config import SearchConfig
-from .wazuh_api_config import WazuhAPIConfig
 from .opensearch_config import OpenSearchConfig
 from .enrich_config import EnrichmentConfig
 from .stix_helper import TLPLiteral, tlp_marking_from_string, validate_stix_id
 from .utils import comma_string_to_set, verify_url
-from .config_base import ConfigBase, FuzzyEnum
+from .config_base import ConfigBase, FuzzyEnum, VersionEnum
 from enum import Enum
 
 
@@ -55,8 +55,7 @@ class Config(ConfigBase):
 
         The amount of incidents created for every option is roughly in the
         following order, from the least to the most: :attr:`Never`,
-        :attr:`PerQuery`, :attr:`PerSighting`, :attr:`PerAlertRule`,
-        :attr:`PerAlert`.
+        :attr:`PerQuery`, :attr:`PerSighting`, :attr:`PerAlertRule`.
         """
 
         PerQuery = "per-query"
@@ -72,15 +71,6 @@ class Config(ConfigBase):
         """
         Create one incident per distinct alert rule. If there are 4 alerts with
         rule ID 550 and 2 alerts with rule ID 80792, only two alerts are created.
-        """
-        PerAlert = "per-alert"
-        """
-        Create one incident for every alert.
-
-        .. warning:: Using this option is highly discouraged, as it will
-                    potentially create a lot of incidents.
-
-        .. note:: Enrichment is curently not implemented for this option.
         """
         Never = "never"
         """
@@ -112,6 +102,30 @@ class Config(ConfigBase):
         Critical severity
         """
 
+    class WazuhVersion(VersionEnum):
+        """
+        Wazuh version range used for various purposes
+
+        As Wazuh evolves, things change. This version number (range) is used to
+        adapt logic depending on the version of Wazuh (and its corresponding
+        version of OpenSearch).
+        """
+
+        v47 = "4.7.x"
+        """
+        Lowest supported version of Wazuh
+
+        Older versions most likely work, but links may not work as expected if
+        Wazuh's version of OpenSearch dashboard differs significantly.
+        """
+        v48 = "4.8.x"
+        """
+        Latest and current version of Wazuh
+
+        In this version, Wazuh has renamed some of their endpoints in their
+        URLs.
+        """
+
     opencti: OpenCTIConfig = Field(default_factory=OpenCTIConfig.from_env)
     """
     OpenCTI-specific configuration
@@ -131,7 +145,6 @@ class Config(ConfigBase):
     opensearch: OpenSearchConfig = Field(
         default_factory=lambda: OpenSearchConfig.model_validate({})
     )
-    api: WazuhAPIConfig = Field(default_factory=WazuhAPIConfig)
 
     max_tlp: TLPLiteral
     """
@@ -284,11 +297,30 @@ class Config(ConfigBase):
     Creating incidents for every vulnerability (or several incidents, depending
     on :attr:`create_incident`) can quickly become very noisy. This setting
     ensures that incidents are only created for vulenerability sightings if a
-    CVSS3 score is present in the vulnerability, and if that score is high
-    enough. If this setting is None, incidents will never be created.
+    :term:`CVSS3` score is present in the vulnerability, and if that score is
+    high enough. If this setting is None, incidents will never be created.
+
+    If the CVSS3 score is unavailable, but the CVSS3 severity is present, the
+    severity's corresponding score (the median) is used.
+
+    If severity is not available, an attempt is made to extract CVSS3 score
+    from the severity metadata in thin the in the search hits.
 
     Sightings will always be created, regardless of whether the CVSS3 score is
     present and above the threshold.
+    """
+    vulnerability_incident_active_only: bool = True
+    """
+    Only create incidents when a vulnerability is still active in a system
+
+    If this setting is enabled, incidents will not be created for
+    vulernabilities spotted in a system, if the vulnerability has since been
+    removed or fixed (by patching the vulnerable software or removing it). If
+    the vulnerability is active somehow again after having been fixed, an
+    innident will be created.
+
+    Note that if a search is limited due to too many hits, incidents may be
+    created due to lack of information.
     """
     create_incident_threshold: int = Field(
         ge=1,
@@ -303,10 +335,78 @@ class Config(ConfigBase):
     will be created. However, a sighting may still be created.
 
 
-    .. note:: Note that an alert rule level is not necessarily a good filter. A
-       :term:`FIM`/syscheck alert informing that a file has been added to a
-       system is not a high-severity alert, but it could be the alert that
-       results in an :term:`IoC` match against a file hash.
+    .. warning::
+        Note that an alert rule level is not really a good filter. For
+        instance, a :term:`FIM`/syscheck alert informing that a file has been
+        added to a system is not a high-severity alert, but it could be the
+        alert that results in an :term:`IoC` match against a file hash. Setting
+        this setting higher than 3 will essentially disabling searching for a
+        number of :term:`SCOs <SCO>`.
+    """
+    # TODO: apply this as a filter in OpenSearch instead of filtering the
+    # results:
+    rule_exclude_list: set[str] = set()
+    """
+    Ignore all alerts with this :term:`rule ID <Alert rule ID>`
+
+    .. seealso::
+
+        If you want to keep sightings from alerts, but avoid getting incidents,
+        configure :attr:`incident_rule_exclude_list` instead.
+    """
+    incident_rule_exclude_list: set[str] = set()
+    """
+    Do not create incidents for alerts with these :term:`rule IDs <Alert rule ID>`
+
+    This setting may be useful to limit noise from alerts caused by login
+    attempts and web server accceses on public-facing servers. Sightings are
+    still created. Use :attr:`rule_exclude_list` instead if you want to ignore
+    these alerts altogether.
+
+    Here are some notable rules that may produce a lot of noise if your
+    :term:`IoCs <IoC>` include a lot of IP addresses from spam and abuse
+    sources:
+
+    .. list-table:: Noisy :term:`alert rules <Alert rule ID>`
+       :header-rows: 1
+
+       * - Rule ID
+         - Description
+       * - 2502
+         - syslog: User missed the password more than one time
+       * - 3398
+         - Postfix: Illegal address from unknown sender # TODO: investigate
+       * - 5503
+         - PAM: User login failed
+       * - 5710
+         - sshd: Attempt to login using a non-existent user
+       * - 5712
+         - sshd: brute force trying to get access to the system. Non existent user.
+       * - 5718
+         - sshd: Attempt to login using a denied user
+       * - 5719
+         - sshd: Multiple access attempts using a denied user
+       * - 5758
+         - Maximum authentication attempts exceeded
+       * - 5762
+         - sshd: connection reset
+       * - 30305
+         - Apache: Attempt to access forbidden file or directory
+       * - 31101
+         - Web server 400 error code
+       * - 31104
+         - Common web attack
+       * - 31151
+         - Multiple web server 400 error codes from same source ip
+       * - 31515
+         - PHPMyAdmin scans (looking for setup.php)
+       * - 31516
+         - Suspicious URL access
+       * - 86601
+         - Suricata alerts (no disctinction between Suricata signatures)
+       * - 91545
+         - Office 365: Secure Token Service (STS) logon events in Azure Active
+           Directory
     """
     create_agent_ip_observable: bool = True
     """
@@ -322,33 +422,6 @@ class Config(ConfigBase):
 
     All entities with this author will be ignored. See FIXREF: recusion. See
     also :attr:`label_ignore_list`, which may be a better solution.
-    """
-    enrich_agent: bool = True
-    """
-    Enrich agent system identities with information from the Wazuh API (if
-    enabled). The following information is provided as a Markdown table in the
-    identity description:
-
-    .. list-table:: Agent information
-       :stub-columns: 1
-
-       * - ID
-         - Three-digit agent ID
-       * - Name
-         - (typically hostname)
-       * - Status
-         -   * active
-             * pending
-             * never_connected
-             * disconnected
-       * - OS name
-         - e.g. Ubuntu, Microsoft Windows 10 Pro
-       * - OS version
-         - e.g. 20.0.4.6 LTS, 10.0.19045.4170
-       * - Agent version
-         - e.g. Wazuh v4.7.3
-       * - IP address
-         - (current public-facing IP address)
     """
     label_ignore_list: set[str] = Field(
         default={"hygiene", "wazuh_ignore"},
@@ -398,6 +471,28 @@ class Config(ConfigBase):
     app_url: AnyHttpUrl
     """
     URL used to create links to the Wazuh dashboard
+
+    .. note::
+
+        If you do not use the version of OpenSearch provided by Wazuh, or if
+        you use Elastic, links probably will not work at all. You still have to
+        prive a valid URL.
+    """
+    wazuh_version: WazuhVersion = Field(
+        validation_alias=AliasChoices("version", "wazuh_version"),
+        default=WazuhVersion.v48,
+    )
+    """
+    Version (range) of Wazuh
+
+    The connector may have to adapt its internal logic and availability of
+    features depending on the version of Wazuh. Currently, this information is
+    only used to adapt links to the Wazuh dashboard.
+
+    .. note::
+
+        If you do not use the version of OpenSearch provided by Wazuh, or if
+        you use Elastic, links probably will not work at all.
     """
     # TODO: include in doc everywhere that refers to create_obs_sightings and require_indicator_for_incidents
     require_indicator_detection: bool = False
@@ -438,7 +533,7 @@ class Config(ConfigBase):
     *revoked* property set to true.
 
     In recent OpenCTI versions, :octiu:`indicator lifecycle management
-    <indicators-lifecycle>` will automatically adjut the score according to
+    <indicators-lifecycle>` will automatically adjust the score according to
     :octia:`decay rules <decay-rules>`.
     """
 

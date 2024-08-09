@@ -15,6 +15,8 @@ Number = TypeVar("Number", int, float)
 SimpleTypeType = TypeVar("SimpleTypeType", type(int), type(str), type(dict), type(list))
 # TODO: use typevars to assert correct dict/mapping in and out of functions
 Obj = TypeVar("Obj", bound=Mapping)
+SimpleType = str | int | float | bool | None
+SimpleObj = dict[str, SimpleType]
 
 REGISTRY_PATH_REGEX = r"^(?:HKEY_(?:LOCAL_MACHINE|CURRENT_USER|CLASSES_ROOT|USERS|CURRENT_CONFIG)|HK(?:LM|CU|CR|U|CC))"
 SID_REGEX = r"S-1-[0-59]-[0-9]{2}-[0-9]{8,10}-[0-9]{8,10}-[0-9]{8,10}-[1-9][0-9]{3,9}"
@@ -26,7 +28,7 @@ class SafeProxy:
     otherwise just returns None
 
     This utility is useful when manipulating objects that may be None without
-    having to catch exceptions or implemention guards.
+    having to catch exceptions or implementation guards.
 
     Examples:
 
@@ -157,6 +159,7 @@ def oneof_nonempty(*keys: str, within: dict, default=None) -> Any:
     )
 
 
+# TODO: use truthy like oneof_nonempty:
 def allof_nonempty(*keys: str, within: dict) -> list[Any]:
     """
     Return all non-empty values of keys found in dict.
@@ -303,6 +306,19 @@ def extract_fields(
     return {k: v for k, v in results.items() if v is not None}
 
 
+def extract_field(obj: Mapping, field: str, default: Any = None) -> Any:
+    """
+    Extract a value from a dict recursively using a key path
+
+    Examples:
+
+    >>> extract_field({'a': {'b': 1}}, 'a.b')
+    1
+    >>> extract_field({'a': {'b': 1}}, 'a.b.c')
+    """
+    return extract_fields(obj, [field], raise_if_missing=False).get(field, default)
+
+
 def search_fields(obj: Mapping, fields: list[str], *, regex: str = "") -> dict:
     """
     Search a dict for fields using key paths
@@ -385,6 +401,30 @@ def field_or_default(obj: Mapping, field: str, default: Any) -> Any:
     'bar'
     """
     return result if (result := search_field(obj, field)) is not None else default
+
+
+def nonempty_field_or_default(obj: Mapping, fields: list[str], default: Any) -> Any:
+    """
+    Return the first result from search_field, otherwise a default value
+
+    Examples:
+
+    >>> nonempty_field_or_default({'a': {'b': 'foo'}}, ['baz', 'a.b'], 'bar')
+    'foo'
+    >>> nonempty_field_or_default({'a': {'b': 'foo'}}, ['b.c'], 'bar')
+    'bar'
+    >>> nonempty_field_or_default({'a': {'b': 'foo'}}, ['baz', 'b.a'], 'bar')
+    'bar'
+    """
+    return next(
+        (
+            res
+            for field in fields
+            for res in (search_field(obj, field),)
+            if res is not None
+        ),
+        default,
+    )
 
 
 def field_as_list(obj: Mapping, field: str) -> list[Any]:
@@ -500,9 +540,9 @@ def rule_level_to_severity(level: int):
             return "low"
 
 
-def cvss3_to_severity(score: float):
+def cvss3_score_to_severity(score: float) -> str:
     """
-    Convert vulnerability CVSS3 score to incident severity
+    Convert vulnerability CVSS3 score to severity
     """
     match score:
         case score if score > 9.0:
@@ -513,6 +553,25 @@ def cvss3_to_severity(score: float):
             return "medium"
         case _:
             return "low"
+
+
+def cvss3_severity_to_score(severity: str, *, default=0.0) -> float:
+    """
+    Convert vulnerability CVSS3 severity to score
+
+    The middle value of the score range is used
+    """
+    match severity.lower():
+        case "critical":
+            return 9.5
+        case "high":
+            return 7.95
+        case "medium":
+            return 5.45
+        case "low":
+            return 2.0
+        case _:
+            return default
 
 
 # TODO: This will break if case_priority_ov is customised by user. Make configurable in setting
@@ -565,6 +624,33 @@ def common_prefix_string(strings: list[str], elideString: str = "[…]"):
         return common + elideString
 
 
+def truncate_string(string: str, *, limit: int = 80, elideString: str = "[…]") -> str:
+    """
+    Truncate string to desired length and add an elide string
+
+    The elide string's length is taken into consideration when comparing
+    against :paramref:`limit`.
+
+    Examples
+
+    >>> truncate_string('foo bar baz qux', limit=12)
+    'foo bar b[…]'
+    >>> truncate_string('foo bar baz qux', limit=2, elideString='too long')
+    'too long'
+    >>> truncate_string('foo bar baz qux', limit=1, elideString='–')
+    '–'
+    """
+    return (
+        string[: max(0, limit - len(elideString))] + elideString
+        if len(string) > limit
+        else string
+    )
+
+
+# TODO: (to be used in match md table):
+# def truncate_string_around(string: str, *, around: str, limit: int = 80, elideString: str = "[…]") -> str:
+
+
 def list_or_empty(obj: dict, key: str):
     """
     Return list at the given key or an empty list if it does not exist.
@@ -585,8 +671,8 @@ def lists_or_empty(obj: Mapping, *keys: str):
     """
     Return a concatenated list of all lists at the given keys
 
-    If any of the keys do not exist, nothing happends. However, if the key
-    exist, it must be a list.
+    If any of the keys do not exist, nothing happens. However, if the key
+    exists, it must be a list.
 
     Examples:
 
@@ -649,6 +735,31 @@ def escape_lucene_regex(string: str):
     # Replace any unescaped single backslashes:
     string = re.sub(r"(?<!\\)\\(?!\\)", r"\\\\", string)
     return "".join("\\" + ch if ch in reg_chars else ch for ch in string)
+
+
+def escape_markdown(string: str) -> str:
+    md_chars = [
+        "`",
+        "*",
+        "_",
+        "{",
+        "}",
+        "[",
+        "]",
+        "<",
+        ">",
+        "(",
+        ")",
+        "#",
+        # "+",
+        # "-",
+        # ".",
+        "!",
+        "|",
+    ]
+    # Replace any unescaped single backslashes:
+    string = re.sub(r"(?<!\\)\\(?!\\)", r"\\\\", string)
+    return "".join("\\" + ch if ch in md_chars else ch for ch in string)
 
 
 def escape_path(path: str, *, count: int = 2):
@@ -773,7 +884,7 @@ def ip_proto(addr: str) -> Literal["ipv4", "ipv6"] | None:
 
 def ip_protos(*addrs: str) -> list[str]:
     """
-    Return a list of the literals, 'ipv4' or 'ipv6', for any valid IP addres
+    Return a list of the literals 'ipv4' or 'ipv6' for any valid IP address
 
     Examples:
 
@@ -823,7 +934,7 @@ def validate_mac(mac: str) -> bool:
     >>> validate_mac('0102.0304.abCD') # Cisco-style
     True
     """
-    # Allow hyphons, colons or no separators, but require the separators to be
+    # Allow hyphoes, colons or no separators, but require the separators to be
     # consistent. Or match a Cisco-style format:
     return bool(
         re.match(
@@ -835,9 +946,9 @@ def validate_mac(mac: str) -> bool:
 
 def normalise_mac(mac: str) -> str:
     """
-    Return a MAC with colons and loer-case characters
+    Return a MAC with colons and lower-case characters
 
-    The string must be a valid mac, otherwise an exception is possibly thrown.
+    The string must be a valid MAC, otherwise an exception is possibly thrown.
 
     Examples:
 
@@ -860,7 +971,6 @@ def mac_permutations(mac: str) -> list[str]:
     """
     Return MAC in different cases and styles (with or without colon, and
     Cisco-style)
-
 
     Examples:
 
@@ -1205,6 +1315,20 @@ def remove_empties(
         return value
 
 
+def remove_nones(obj: Mapping) -> dict:
+    """
+    Remove all Nones from a dict
+
+    Nulls are not removed recursively. See also :attr:`remove_empties`.
+
+    Example:
+
+    >>> remove_nones({'a': 1, 'b': None})
+    {'a': 1}
+    """
+    return {key: value for key, value in obj.items() if value is not None}
+
+
 def parse_human_datetime(timestamp: str) -> datetime | timedelta | None:
     """
     Parse a string containing a date, time or interval into a
@@ -1388,3 +1512,120 @@ def remove_host_from_uri(uri: str) -> str:
     '/baz'
     """
     return re.sub(r"^(?:.+://)?[^/]+(?=/)", "", uri)
+
+
+def raises(func: Callable[[], Any]) -> bool:
+    """
+    Return true if the callback raises an exception
+
+    Examples:
+
+    >>> raises(lambda: 1/0)
+    True
+    >>> raises(lambda: 'foo')
+    False
+    """
+    try:
+        func()
+        return False
+    except Exception:
+        return True
+
+
+def remove_newlines(string: str) -> str:
+    return re.sub("[\r\n]+", "", string)
+
+
+# TODO: Require length of header tuple to match that of rows (waiting for Python 3.12):
+def md_table(
+    rows: Sequence[tuple[str, ...]], *, header: tuple[str, ...] | None = None
+) -> str:
+    """
+    Create a Markdown table from the list of tuples
+
+    A single-column table is not supported, as the string will interpreted as a list and result in single-character columns.
+
+    Examples:
+
+    >>> md_table([('foo', 'bar'), ('baz', 'qux')], header=('Foo', 'Bar'))
+    '|Foo|Bar|\\n|---|---|\\n|foo|bar|\\n|baz|qux|'
+    >>> md_table([('Foo', 'Bar'), ('baz', 'qux')])
+    '|Foo|Bar|\\n|---|---|\\n|baz|qux|'
+    >>> md_table([('foo', 'bar')])
+    '|foo|bar|\\n|---|---|\\n'
+    >>> md_table([])
+    ''
+    """
+    if not header and not rows:
+        return ""
+
+    return (
+        # |Header1|Header2|:
+        f"|{'|'.join((h for h in (header or rows[0])))}|\n"
+        # |---|---|:
+        + f"|{'|'.join(('---' for _ in range(len(header or rows[0]))))}|\n"
+        # |val1|val2|
+        # |val3|val4| etc.:
+        + "\n".join(
+            # OpenCTI's Markdown renderer does not support any kind of newline
+            # inside tables:
+            (
+                f"|{'|'.join((escape_markdown(remove_newlines(col)) for col in row))}|"
+                for row in (rows if header else rows[1:])
+            )
+        )
+    )
+
+
+def unnest_obj(obj: Mapping[str, Any]) -> SimpleObj:
+    """
+    Unnest a dict recursively into a flat dict
+
+    The resulting keys are paths like 'foo.bar.baz', 'foo[0].bar' etc., and the
+    keys are either str, int, float, bool or None.
+
+    If a list only contains simple types, it will not be unnested. Instead the
+    resulting value will be ", "-joined string.
+    """
+
+    def unnest_list_(items: list[Any], parent_key: str) -> list[tuple[str, SimpleType]]:
+        if all(isinstance(item, SimpleType) for item in items):
+            return [(parent_key, ", ".join((str(item) for item in items)))]
+
+        kvs: list[tuple[str, SimpleType]] = []
+        for i, item in enumerate(items):
+            new_key = f"{parent_key}[{i}]"
+            if isinstance(item, list):
+                kvs.extend(unnest_list_(item, new_key))
+            elif isinstance(item, dict):
+                kvs.extend(unnest_obj_(item, new_key).items())
+            else:
+                kvs.append((new_key, item))
+
+        return kvs
+
+    def unnest_obj_(obj: Mapping[str, Any], parent_key: str = "") -> SimpleObj:
+        kvs: list[tuple[str, SimpleType]] = []
+        for k, v in obj.items():
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            if isinstance(v, dict):
+                kvs.extend(unnest_obj_(v, new_key).items())
+            elif isinstance(v, list):
+                kvs.extend(unnest_list_(v, new_key))
+            elif not isinstance(v, SimpleType):
+                raise ValueError(
+                    f"The member {new_key} is a {type(v).__name__} and not a simple type"
+                )
+            else:
+                kvs.append((new_key, v))
+
+        return dict(kvs)
+
+    return unnest_obj_(obj)
+
+
+def obj_to_md_table(obj: Mapping[str, Any]) -> str:
+    return md_table(
+        [(k, "" if v is None else str(v)) for k, v in unnest_obj(obj).items()],
+        header=("Key", "Value"),
+    )

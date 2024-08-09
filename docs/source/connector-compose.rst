@@ -9,13 +9,13 @@ more complete example.
 
 .. note::
    
-   You cannot run any of the docker-compose examples ase they are without
+   You cannot run any of the docker-compose examples as they are without
    replacing URLs, usernames and passwords. See :ref:`required settings
    <required-settings>`.
 
 .. include:: alpha_warning.rst
 
-.. literalinclude:: connector-compose-simple.yml
+.. subst_literalinclude:: connector-compose-simple.yml
    :language: yaml
    :linenos:
 
@@ -24,7 +24,7 @@ more complete example.
 The following expands on the example above, with most or all available settings
 with their default values:
 
-.. literalinclude:: connector-compose.yml
+.. subst_literalinclude:: connector-compose.yml
    :language: yaml
    :linenos:
 
