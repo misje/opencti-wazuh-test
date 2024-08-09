@@ -25,7 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-tags: true
+          # TODO: Whenever issues with "git describe" is resolved in
+          # actions/checkout, stop using fetch-depth:
+          #fetch-tags: true
+          fetch-depth: 0
 
       - id: set_matrix
         name: Set matrix data (OpenCTI versions to build for)
