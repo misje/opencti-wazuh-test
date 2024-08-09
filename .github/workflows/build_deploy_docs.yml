@@ -52,7 +52,7 @@ jobs:
 
       - name: Build sphinx HTML
         env:
-          CONNECTOR_RELEASE: ${{ steps.configure.outputs.connector_release }}
+          CONNECTOR_RELEASE: ${{ needs.configure.outputs.connector_release }}
         run: sphinx-build -W -b html docs/source docs/build
 
       - uses: actions/configure-pages@v5
