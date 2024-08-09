@@ -20,10 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # TODO: Whenever issues with "git describe" is resolved in
-          # actions/checkout, stop using fetch-depth:
-          #fetch-tags: true
-          fetch-depth: 0
+          fetch-tags: true
+          #fetch-depth: 0
 
       - id: get_release
         name: Get connector (latest/previous) release
