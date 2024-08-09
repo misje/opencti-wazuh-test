@@ -8,9 +8,12 @@ project = "opencti-wazuh-connector"
 copyright = "2024, Andreas Misje"  # pylint: disable=redefined-builtin
 author = "Andreas Misje"
 # Get latest release version from the last git tag on the current branch:
-release = subprocess.run(
-    ["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True
-).stdout.rstrip()
+release = os.getenv(
+    "CONNECTOR_RELEASE",
+    subprocess.run(
+        ["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True
+    ).stdout.rstrip(),
+)
 
 # -- misc. ---------- --------------------------------------------------------
 # Generate table of "compatible" OpenCTI versions:

@@ -20,14 +20,17 @@ jobs:
   configure:
     runs-on: ubuntu-22.04
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
       connector_version_any: ${{ steps.get_version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-tags: true
+          # TODO: Whenever issues with "git describe" is resolved in
+          # actions/checkout, stop using fetch-depth:
+          #fetch-tags: true
+          fetch-depth: 0
 
-      - id: set-matrix
+      - id: set_matrix
         name: Set matrix data (OpenCTI versions to build for)
         run: |
           echo matrix="$(jq -c '{opencti_version}' build_metadata.json)" >> $GITHUB_OUTPUT
