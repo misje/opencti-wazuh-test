@@ -70,6 +70,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
             suffix=_${{ matrix.opencti_version }}
+            latest=false
           tags: |
             type=ref,event=branch
             type=ref,event=pr
