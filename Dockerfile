@@ -1,6 +1,5 @@
 FROM python:3.12-alpine AS build
 ARG PYCTI_VERSION="6.2.7" # NOTE: If building locally, replace/update this!
-ARG CONNECTOR_VERSION="0.3.0" # NOTE: If building locally, replace/update this!
 WORKDIR /app
 
 RUN apk --no-cache add build-base
@@ -10,6 +9,7 @@ RUN sed -ri "s/__PYCTI_VERSION__/${PYCTI_VERSION}/" requirements.txt && \
 
 
 FROM python:3.12-alpine
+ARG CONNECTOR_VERSION="0.3.0" # NOTE: If building locally, replace/update this!
 WORKDIR /app
 ENV CONNECTOR_TYPE=INTERNAL_ENRICHMENT
 
