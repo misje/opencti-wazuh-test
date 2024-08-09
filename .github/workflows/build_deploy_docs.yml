@@ -25,7 +25,7 @@ jobs:
         run: |
           # Use latest OpenCTI/pycti version (just any really – we just need
           # sphinx to be able to parse/import the source files):
-          pip install -r <(sed -r "s/__PYCTI_VERSION__/$(jq '.opencti_version|sort|last' build_metadata.json)/" src/requirements.txt)
+          pip install -r <(sed -r "s/__PYCTI_VERSION__/$(jq -r '.opencti_version|sort|last' build_metadata.json)/" src/requirements.txt)
       - name: Install doc. dependencies
         run: pip install -r docs/requirements.txt
       - name: Build sphinx HTML
