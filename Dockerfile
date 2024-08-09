@@ -1,10 +1,12 @@
 FROM python:3.12-alpine AS build
-ARG PYCTI_VERSION="6.2.7"
+ARG PYCTI_VERSION="6.2.7" # NOTE: If building locally, replace/update this!
+ARG CONNECTOR_VERSION="0.3.0" # NOTE: If building locally, replace/update this!
 WORKDIR /app
 
 RUN apk --no-cache add build-base
 COPY src/requirements.txt .
 RUN sed -ri s/__PYCTI_VERSION__/${PYCTI_VERSION}/ requirements.txt && \
+   sed -ri s/__CONNECTOR_VERSION__/${CONNECTOR_VERSION}/ src/wazuh/wazuh.py && \
    pip3 wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
 
 

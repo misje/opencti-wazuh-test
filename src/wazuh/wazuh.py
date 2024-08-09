@@ -172,7 +172,7 @@ class WazuhConnector:
                 self.metric.inc("client_error_count")
 
     def __init__(self, config: Config):
-        self.CONNECTOR_VERSION: Final[str] = "0.3.0"
+        self.CONNECTOR_VERSION: Final[str] = "__CONNECTOR_VERSION__"
 
         self.conf = config
         self.helper = OpenCTIConnectorHelper(

@@ -27,6 +27,7 @@ jobs:
         name: Set matrix data (OpenCTI versions to build for)
         run: |
           echo matrix="$(jq -c '{opencti_version}' build_metadata.json)" >> $GITHUB_OUTPUT
+          echo CONNECTOR_VERSION_ANY="$(git describe --always --dirty)" >> $GITHUB_ENV
 
   build_and_push_image:
     runs-on: ubuntu-22.04
@@ -80,7 +81,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            OPENCTI_VERSION=${{ matrix.opencti_version }}
+            PYCTI_VERSION=${{ matrix.opencti_version }}
+            CONNECTOR_VERSION=${{ env.CONNECTOR_VERSION_ANY }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
