@@ -5,8 +5,7 @@ WORKDIR /app
 
 RUN apk --no-cache add build-base
 COPY src/requirements.txt .
-RUN sed -ri s/__PYCTI_VERSION__/${PYCTI_VERSION}/ requirements.txt && \
-   sed -ri s/__CONNECTOR_VERSION__/${CONNECTOR_VERSION}/ src/wazuh/wazuh.py && \
+RUN sed -ri "s/__PYCTI_VERSION__/${PYCTI_VERSION}/" requirements.txt && \
    pip3 wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
 
 
@@ -24,4 +23,5 @@ COPY --from=build /app/wheels /wheels
 COPY --from=build /app/requirements.txt .
 RUN pip3 install --no-cache-dir /wheels/*
 COPY src .
+RUN sed -ri "s/__CONNECTOR_VERSION__/${CONNECTOR_VERSION}/" wazuh/wazuh.py
 ENTRYPOINT ["python3", "main.py"]
