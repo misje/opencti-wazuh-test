@@ -32,4 +32,4 @@ jobs:
         env:
           PYTHONPATH: src
         # TODO: Coverage reports:
-        run: pytest --doctest-glob '*.py' --doctest-glob '*.rst' --doctest-modules
+        run: pytest --doctest-glob '*.py' --doctest-glob '*.rst' --doctest-modules --ignore-glob docs/source/conf.py --ignore-glob docs/source/extensions/*.py
