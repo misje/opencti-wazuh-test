@@ -23,11 +23,14 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
       - id: set-matrix
         name: Set matrix data (OpenCTI versions to build for)
         run: |
           echo matrix="$(jq -c '{opencti_version}' build_metadata.json)" >> $GITHUB_OUTPUT
-          echo connector_version_any="$(git describe --always --dirty)" >> $GITHUB_OUTPUT
+          #echo connector_version_any="$(git describe --always --dirty)" >> $GITHUB_OUTPUT
+          echo connector_version_any="foo" >> $GITHUB_OUTPUT
 
   build_and_push_image:
     runs-on: ubuntu-22.04
